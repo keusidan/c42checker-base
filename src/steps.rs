@@ -1,6 +1,6 @@
 use crate::args::{extra_cflags, normalize_args, step_args};
 use crate::build::{build_binary, build_inputs, NO_MAIN_HINT, NO_MAIN_REASON};
-use crate::exec::{exec_cmd, ExecOptions};
+use crate::exec::{exec_cmd, exec_cmd_env, ExecOptions};
 use crate::exclude::is_excluded;
 use crate::makefile::{check_makefile, to_diags as makefile_diags};
 use crate::normextra::run_norm_extra;
@@ -510,15 +510,44 @@ fn run_gcc_analyzer(ctx: &Context) -> StepOutcome {
             force_c_locale: true,
         },
     );
-    let diags = parse_compiler_output(&res.output, &ctx.root, "gcc-analyzer");
     let log = format!("$ {gcc} {}\n{}", args.join(" "), res.output);
+    if res.code != Some(0)
+        && (res.output.contains("unknown argument: '-fanalyzer'")
+            || res.output.contains("unrecognized command-line option '-fanalyzer'"))
+    {
+        return StepOutcome {
+            status: crate::types::StepStatus::Skip,
+            diags: Vec::new(),
+            log,
+            reason: Some("この gcc は -fanalyzer に対応していません (macOS の /usr/bin/gcc は Apple clang のため未対応)".to_string()),
+            hint: Some("macOS で gcc -fanalyzer を使うには `brew install gcc` で GNU GCC を入れてください (使わない場合はチェックを外してください)".to_string()),
+        };
+    }
+    let diags = parse_compiler_output(&res.output, &ctx.root, "gcc-analyzer");
     verdict(res.code, diags, log, res.error, res.timed_out)
+}
+
+fn is_sanitizer_runtime_missing(output: &str) -> bool {
+    output.contains("unsupported option '-fsanitize")
+        || output.contains("invalid argument") && output.contains("-fsanitize")
+        || output.contains("libclang_rt.")
+        || output.contains("library 'clang_rt.")
+        || output.contains("library not found for -lclang_rt")
+}
+
+fn is_sanitizer_cannot_start(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("unexpected memory mapping")
+        || lower.contains("threadsanitizer: unsupported")
+        || lower.contains("memorysanitizer: unsupported")
+        || (lower.contains("fatal:") && (lower.contains("mapping") || lower.contains("aslr")))
 }
 
 fn run_binary_with_optional_setarch(
     ctx: &Context,
     bin: &Path,
     use_setarch: bool,
+    extra_env: &[(&str, &str)],
 ) -> crate::exec::ExecResult {
     let run_args = normalize_args(&ctx.settings.run_args, &ctx.root);
     let timeout_ms = ctx.settings.run_timeout_sec * 1000;
@@ -528,7 +557,7 @@ fn run_binary_with_optional_setarch(
             args.push("-R".to_string());
             args.push(bin.to_string_lossy().into_owned());
             args.extend(run_args.clone());
-            let r = exec_cmd(
+            let r = exec_cmd_env(
                 setarch,
                 &args,
                 &ExecOptions {
@@ -537,13 +566,14 @@ fn run_binary_with_optional_setarch(
                     cancelled: Some(ctx.cancelled.clone()),
                     force_c_locale: true,
                 },
+                extra_env,
             );
             if r.error.is_none() {
                 return r;
             }
         }
     }
-    exec_cmd(
+    exec_cmd_env(
         &bin.to_string_lossy(),
         &run_args,
         &ExecOptions {
@@ -552,6 +582,7 @@ fn run_binary_with_optional_setarch(
             cancelled: Some(ctx.cancelled.clone()),
             force_c_locale: true,
         },
+        extra_env,
     )
 }
 
@@ -568,6 +599,16 @@ fn run_sanitizer_step(
     let out_dir = ctx.work_dir.join(dir_name);
     let b = build_binary(ctx, &out_dir, flags, "clang", Some(step_id));
     if !b.ok {
+        if is_sanitizer_runtime_missing(&b.output) {
+            return skip_outcome(
+                format!("{} のランタイムが使えません (この clang が未対応、または libclang_rt が未導入)", step_id.label()),
+                Some(if cfg!(target_os = "macos") {
+                    "macOS の Apple clang は MSan 等の一部 sanitizer に非対応です。この項目のチェックを外してください"
+                } else {
+                    "clang の sanitizer ランタイム (libclang-rt / compiler-rt) が必要です"
+                }),
+            );
+        }
         return StepOutcome {
             status: crate::types::StepStatus::Fail,
             diags: b.diags,
@@ -576,9 +617,36 @@ fn run_sanitizer_step(
             hint: None,
         };
     }
-    let res = run_binary_with_optional_setarch(ctx, &b.bin, use_setarch);
+    let env_pair: (&str, &str) = match step_id {
+        StepId::AsanUbsan => ("ASAN_OPTIONS", "detect_leaks=1:color=never"),
+        StepId::Tsan => ("TSAN_OPTIONS", "color=never"),
+        StepId::Msan => ("MSAN_OPTIONS", "color=never"),
+        _ => ("ASAN_OPTIONS", "color=never"),
+    };
+    let mut res = run_binary_with_optional_setarch(ctx, &b.bin, use_setarch, &[env_pair]);
+    let mut log = format!("{}\n$ {}\n", b.output, b.bin.display());
+    if step_id == StepId::AsanUbsan
+        && (res.output.contains("LeakSanitizer has encountered a fatal error")
+            || res.output.contains("LeakSanitizer does not work under ptrace")
+            || res.output.contains("detect_leaks is not supported on this platform"))
+    {
+        log.push_str(&res.output);
+        log.push_str("\n[c42checker] この環境では LeakSanitizer が使えないため、リーク検査なしで再実行します\n");
+        res = run_binary_with_optional_setarch(
+            ctx,
+            &b.bin,
+            use_setarch,
+            &[("ASAN_OPTIONS", "detect_leaks=0:color=never")],
+        );
+    }
+    log.push_str(&res.output);
+    if is_sanitizer_cannot_start(&res.output) {
+        return skip_outcome(
+            format!("{} がこの環境で起動できませんでした", step_id.label()),
+            Some("この環境で起動できない場合は、この項目のチェックを外してください"),
+        );
+    }
     let diags = parse_sanitizer(&res.output, &ctx.root);
-    let log = format!("{}\n$ {}\n{}", b.output, b.bin.display(), res.output);
     verdict(res.code, diags, log, res.error, res.timed_out)
 }
 

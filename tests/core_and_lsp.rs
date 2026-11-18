@@ -5,9 +5,12 @@ use c42checker_base::exclude::matches_pattern;
 use c42checker_base::makefile::check_makefile_text;
 use c42checker_base::parse::{drop_norminette_errors, parse_compiler_output, parse_norminette, NORMINETTE_PARAMETER_CODES};
 use c42checker_base::proto::{normalize_params, normalize_return_type, render_block, ProtoEntry};
+use c42checker_base::tools::{augment_darwin_path, detect_tools_for_os, find_highest_versioned};
 use c42checker_base::types::FailFast;
 use serde_json::{json, Value};
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -181,4 +184,43 @@ fn test_lsp_initialize_and_detect_tools() {
     );
     let status = child.wait().unwrap();
     assert!(status.success());
+}
+
+#[test]
+fn test_macos_tool_detection_skips_apple_clang_gcc() {
+    let base = std::env::temp_dir().join(format!("c42_tools_test_{}", std::process::id()));
+    let sys_dir = base.join("sys");
+    let brew_dir = base.join("brew");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&sys_dir).unwrap();
+    fs::create_dir_all(&brew_dir).unwrap();
+
+    let mk = |dir: &Path, name: &str, body: &str| {
+        let p = dir.join(name);
+        fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perms = fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&p, perms).unwrap();
+        p.to_string_lossy().into_owned()
+    };
+
+    let apple_gcc = mk(&sys_dir, "gcc", "echo 'Apple clang version 15.0.0'");
+    let gnu_gcc14 = mk(&brew_dir, "gcc-14", "echo 'gcc-14 (Homebrew GCC 14.2.0) 14.2.0'");
+
+    let sys_str = sys_dir.to_string_lossy();
+    let both_str = format!("{}:{}", sys_dir.display(), brew_dir.display());
+
+    assert_eq!(
+        find_highest_versioned("gcc", &both_str).as_deref(),
+        Some(gnu_gcc14.as_str())
+    );
+    assert_eq!(detect_tools_for_os(&sys_str, true).gcc, None);
+    assert_eq!(detect_tools_for_os(&sys_str, false).gcc, Some(apple_gcc));
+    assert_eq!(detect_tools_for_os(&both_str, true).gcc, Some(gnu_gcc14));
+
+    let path = augment_darwin_path("/usr/bin", Some("/Users/alice"));
+    assert!(path.contains("/opt/homebrew/bin"));
+    assert!(path.contains("/Users/alice/.local/bin"));
+
+    let _ = fs::remove_dir_all(&base);
 }

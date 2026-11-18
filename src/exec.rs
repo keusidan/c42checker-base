@@ -24,6 +24,15 @@ pub struct ExecResult {
 }
 
 pub fn exec_cmd(cmd: &str, args: &[String], opts: &ExecOptions<'_>) -> ExecResult {
+    exec_cmd_env(cmd, args, opts, &[])
+}
+
+pub fn exec_cmd_env(
+    cmd: &str,
+    args: &[String],
+    opts: &ExecOptions<'_>,
+    extra_env: &[(&str, &str)],
+) -> ExecResult {
     let mut command = Command::new(cmd);
     command
         .args(args)
@@ -31,8 +40,14 @@ pub fn exec_cmd(cmd: &str, args: &[String], opts: &ExecOptions<'_>) -> ExecResul
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if cfg!(target_os = "macos") {
+        command.env("PATH", crate::tools::effective_env_path());
+    }
     if opts.force_c_locale {
         command.env("LC_ALL", "C");
+    }
+    for (k, v) in extra_env {
+        command.env(k, v);
     }
 
     let mut child = match command.spawn() {
