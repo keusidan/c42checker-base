@@ -522,6 +522,7 @@ fn run_gcc_analyzer(ctx: &Context) -> StepOutcome {
     let log = format!("$ {gcc} {}\n{}", args.join(" "), res.output);
     if res.code != Some(0)
         && (res.output.contains("unknown argument: '-fanalyzer'")
+            || res.output.contains("unknown argument '-fanalyzer'")
             || res.output.contains("unrecognized command-line option '-fanalyzer'"))
     {
         return StepOutcome {
