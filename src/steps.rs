@@ -5,11 +5,11 @@ use crate::exclude::is_excluded;
 use crate::makefile::{check_makefile, to_diags as makefile_diags};
 use crate::normextra::run_norm_extra;
 use crate::parse::{
-    drop_norminette_errors, parse_cbmc, parse_compiler_output, parse_frama_c, parse_norminette,
-    parse_sanitizer, parse_valgrind, strip_ansi, NORMINETTE_PARAMETER_CODES,
+    drop_norminette_errors, parse_cbmc, parse_compiler_output, parse_frama_c, parse_leaks,
+    parse_norminette, parse_sanitizer, parse_valgrind, strip_ansi, NORMINETTE_PARAMETER_CODES,
 };
 use crate::sources::{find_makefile, make_target_exists};
-use crate::tools::{install_hint, machine_arch, step_tool_name};
+use crate::tools::{detect_macos_sdk_root, install_hint, machine_arch, step_tool_name};
 use crate::types::{Context, Diag, Severity, StepId, StepOutcome};
 use crate::workdir::copy_project;
 use std::collections::HashSet;
@@ -33,6 +33,7 @@ fn need_tool(ctx: &Context, key: &str, label: &str) -> Option<StepOutcome> {
         "scanBuild" => ctx.tools.scan_build.as_ref(),
         "gcc" => ctx.tools.gcc.as_ref(),
         "valgrind" => ctx.tools.valgrind.as_ref(),
+        "leaks" => ctx.tools.leaks.as_ref(),
         "norminette" => ctx.tools.norminette.as_ref(),
         "make" => ctx.tools.make.as_ref(),
         "cbmc" => ctx.tools.cbmc.as_ref(),
@@ -155,6 +156,7 @@ pub fn run_step_by_id(ctx: &Context, id: StepId) -> StepOutcome {
             true,
         ),
         StepId::Valgrind => run_valgrind_step(ctx),
+        StepId::Leaks => run_leaks_step(ctx),
         StepId::Cbmc => run_cbmc_step(ctx),
         StepId::FramaC => run_frama_c_step(ctx),
     }
@@ -388,9 +390,16 @@ fn run_clang_tidy(ctx: &Context) -> StepOutcome {
     for s in &ctx.sources {
         args.push(s.to_string_lossy().into_owned());
     }
+    let cflags = extra_cflags(ctx);
     args.push("--".to_string());
     args.extend(inc_flags(ctx));
-    args.extend(extra_cflags(ctx));
+    args.extend(cflags.iter().cloned());
+    if !cflags.iter().any(|a| a == "-isysroot" || a.starts_with("-isysroot")) {
+        if let Some(sdk) = detect_macos_sdk_root() {
+            args.push("-isysroot".to_string());
+            args.push(sdk);
+        }
+    }
 
     let res = exec_cmd(
         tidy,
@@ -617,26 +626,34 @@ fn run_sanitizer_step(
             hint: None,
         };
     }
-    let env_pair: (&str, &str) = match step_id {
-        StepId::AsanUbsan => ("ASAN_OPTIONS", "detect_leaks=1:color=never"),
-        StepId::Tsan => ("TSAN_OPTIONS", "color=never"),
-        StepId::Msan => ("MSAN_OPTIONS", "color=never"),
-        _ => ("ASAN_OPTIONS", "color=never"),
+    let env_pairs: Vec<(&str, &str)> = match step_id {
+        StepId::AsanUbsan => vec![
+            ("ASAN_OPTIONS", "detect_leaks=1:color=never"),
+            ("UBSAN_OPTIONS", "print_stacktrace=1:color=never"),
+        ],
+        StepId::Tsan => vec![("TSAN_OPTIONS", "color=never")],
+        StepId::Msan => vec![("MSAN_OPTIONS", "color=never")],
+        _ => vec![("ASAN_OPTIONS", "color=never")],
     };
-    let mut res = run_binary_with_optional_setarch(ctx, &b.bin, use_setarch, &[env_pair]);
+    let mut res = run_binary_with_optional_setarch(ctx, &b.bin, use_setarch, &env_pairs);
     let mut log = format!("{}\n$ {}\n", b.output, b.bin.display());
+    let lower_out = res.output.to_ascii_lowercase();
     if step_id == StepId::AsanUbsan
-        && (res.output.contains("LeakSanitizer has encountered a fatal error")
-            || res.output.contains("LeakSanitizer does not work under ptrace")
-            || res.output.contains("detect_leaks is not supported on this platform"))
+        && (lower_out.contains("leaksanitizer has encountered a fatal error")
+            || lower_out.contains("leaksanitizer does not work under ptrace")
+            || lower_out.contains("detect_leaks is not supported on this platform")
+            || lower_out.contains("leaksanitizer is not supported"))
     {
         log.push_str(&res.output);
-        log.push_str("\n[c42checker] この環境では LeakSanitizer が使えないため、リーク検査なしで再実行します\n");
+        log.push_str("\n[c42checker] この環境では LeakSanitizer が使えないため、リーク検査なしで再実行します (macOS では `leaks (macOS)` 項目で確認してください)\n");
         res = run_binary_with_optional_setarch(
             ctx,
             &b.bin,
             use_setarch,
-            &[("ASAN_OPTIONS", "detect_leaks=0:color=never")],
+            &[
+                ("ASAN_OPTIONS", "detect_leaks=0:color=never"),
+                ("UBSAN_OPTIONS", "print_stacktrace=1:color=never"),
+            ],
         );
     }
     log.push_str(&res.output);
@@ -690,6 +707,109 @@ fn run_valgrind_step(ctx: &Context) -> StepOutcome {
         out.reason = Some(format!("未クローズのファイルディスクリプタが {} 件あります", parsed.fd_leaks));
     }
     out
+}
+
+fn is_leaks_env_error(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("cannot examine process")
+        || lower.contains("for security reasons")
+        || lower.contains("operation not permitted")
+        || lower.contains("task_for_pid")
+        || lower.contains("unable to inspect")
+}
+
+fn run_leaks_step(ctx: &Context) -> StepOutcome {
+    if !build_inputs(ctx).usable {
+        return skip_outcome(NO_MAIN_REASON, Some(NO_MAIN_HINT));
+    }
+    let out_dir = ctx.work_dir.join("leaks");
+    let b = build_binary(
+        ctx,
+        &out_dir,
+        &["-g", "-O0", "-fno-omit-frame-pointer"],
+        "clang",
+        None,
+    );
+    if !b.ok {
+        return StepOutcome {
+            status: crate::types::StepStatus::Fail,
+            diags: b.diags,
+            log: b.output,
+            reason: Some("leaks 用のビルドに失敗しました".to_string()),
+            hint: None,
+        };
+    }
+    let leaks_bin = ctx.tools.leaks.as_deref().unwrap();
+    let mut args = vec!["-atExit".to_string()];
+    args.extend(step_args(ctx, StepId::Leaks));
+    args.push("--".to_string());
+    args.push(b.bin.to_string_lossy().into_owned());
+    args.extend(normalize_args(&ctx.settings.run_args, &ctx.root));
+
+    let res = exec_cmd_env(
+        leaks_bin,
+        &args,
+        &ExecOptions {
+            cwd: &ctx.root,
+            timeout_ms: ctx.settings.run_timeout_sec * 1000 * 3,
+            cancelled: Some(ctx.cancelled.clone()),
+            force_c_locale: true,
+        },
+        &[("MallocStackLogging", "1")],
+    );
+    let log = format!("{}\n$ {leaks_bin} {}\n{}", b.output, args.join(" "), res.output);
+    if res.timed_out {
+        return StepOutcome {
+            status: crate::types::StepStatus::Skip,
+            diags: Vec::new(),
+            log,
+            reason: Some(format!(
+                "制限時間 {} 秒で中断したため検査が完了していません",
+                ctx.settings.run_timeout_sec * 3
+            )),
+            hint: Some("`c42checker.runTimeoutSec` を延ばすか、終了する引数を指定してください".to_string()),
+        };
+    }
+    let parsed = parse_leaks(&res.output, &ctx.root);
+    if parsed.leak_count == 0 && res.code != Some(0) && is_leaks_env_error(&res.output) {
+        return StepOutcome {
+            status: crate::types::StepStatus::Skip,
+            diags: Vec::new(),
+            log,
+            reason: Some("macOS の権限 / セキュリティ制限により leaks がプロセスを検査できませんでした".to_string()),
+            hint: Some("ターミナルで `DevToolsSecurity -enable` や Xcode Command Line Tools の設定を確認してください".to_string()),
+        };
+    }
+    let leaked = parsed.leak_count > 0 || (res.code == Some(1) && res.error.is_none());
+    let failed = leaked || res.error.is_some() || res.code != Some(0);
+    StepOutcome {
+        status: if failed {
+            crate::types::StepStatus::Fail
+        } else {
+            crate::types::StepStatus::Pass
+        },
+        diags: parsed.diags,
+        log,
+        reason: if failed {
+            res.error.or_else(|| {
+                if leaked {
+                    if parsed.leak_count > 0 {
+                        Some(format!(
+                            "leaks がメモリリークを検出しました ({} 件, {} bytes)",
+                            parsed.leak_count, parsed.leaked_bytes
+                        ))
+                    } else {
+                        Some("leaks がメモリリークを検出しました".to_string())
+                    }
+                } else {
+                    Some(format!("leaks が終了コード {:?} で終了しました", res.code))
+                }
+            })
+        } else {
+            None
+        },
+        hint: None,
+    }
 }
 
 fn run_cbmc_step(ctx: &Context) -> StepOutcome {

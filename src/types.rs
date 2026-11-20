@@ -19,12 +19,13 @@ pub enum StepId {
     Tsan,
     Msan,
     Valgrind,
+    Leaks,
     Cbmc,
     FramaC,
 }
 
 impl StepId {
-    pub const ALL: [StepId; 14] = [
+    pub const ALL: [StepId; 15] = [
         StepId::CFormatter,
         StepId::Norminette,
         StepId::NormExtra,
@@ -37,6 +38,7 @@ impl StepId {
         StepId::Tsan,
         StepId::Msan,
         StepId::Valgrind,
+        StepId::Leaks,
         StepId::Cbmc,
         StepId::FramaC,
     ];
@@ -55,6 +57,7 @@ impl StepId {
             StepId::Tsan => "tsan",
             StepId::Msan => "msan",
             StepId::Valgrind => "valgrind",
+            StepId::Leaks => "leaks",
             StepId::Cbmc => "cbmc",
             StepId::FramaC => "framaC",
         }
@@ -78,6 +81,7 @@ impl StepId {
             StepId::Tsan => "ThreadSanitizer",
             StepId::Msan => "MemorySanitizer",
             StepId::Valgrind => "valgrind",
+            StepId::Leaks => "leaks (macOS)",
             StepId::Cbmc => "cbmc",
             StepId::FramaC => "frama-c",
         }
@@ -97,6 +101,7 @@ impl StepId {
             | StepId::Tsan
             | StepId::Msan
             | StepId::Valgrind
+            | StepId::Leaks
             | StepId::Cbmc
             | StepId::FramaC => 2,
         }
@@ -247,6 +252,7 @@ pub fn default_checks() -> HashMap<StepId, bool> {
     m.insert(StepId::Tsan, false);
     m.insert(StepId::Msan, false);
     m.insert(StepId::Valgrind, true);
+    m.insert(StepId::Leaks, false);
     m.insert(StepId::Cbmc, false);
     m.insert(StepId::FramaC, false);
     m
@@ -317,6 +323,8 @@ pub struct Tools {
     pub gcc: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub valgrind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leaks: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub norminette: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

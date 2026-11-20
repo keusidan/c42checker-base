@@ -4,6 +4,30 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
+
+fn darwin_python_user_bins(home: &str) -> Vec<String> {
+    let py_root = Path::new(home).join("Library").join("Python");
+    let Ok(entries) = fs::read_dir(&py_root) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<(Vec<u32>, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let parts: Option<Vec<u32>> = name
+            .split('.')
+            .map(|p| p.parse::<u32>().ok())
+            .collect();
+        if let Some(nums) = parts {
+            if !nums.is_empty() {
+                let bin = py_root.join(&name).join("bin");
+                versions.push((nums, bin.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    versions.sort_by(|a, b| b.0.cmp(&a.0));
+    versions.into_iter().map(|(_, p)| p).collect()
+}
 
 pub fn augment_darwin_path(base_path: &str, home: Option<&str>) -> String {
     let mut dirs: Vec<String> = base_path
@@ -14,6 +38,8 @@ pub fn augment_darwin_path(base_path: &str, home: Option<&str>) -> String {
     let mut extras = Vec::new();
     if let Some(h) = home {
         extras.push(format!("{h}/.local/bin"));
+        extras.push(format!("{h}/.cargo/bin"));
+        extras.extend(darwin_python_user_bins(h));
     }
     extras.extend([
         "/opt/homebrew/bin".to_string(),
@@ -39,6 +65,32 @@ pub fn effective_env_path() -> String {
     }
 }
 
+static MACOS_SDK_CACHE: OnceLock<Option<String>> = OnceLock::new();
+
+pub fn detect_macos_sdk_root() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    if let Ok(sdk) = env::var("SDKROOT") {
+        if !sdk.trim().is_empty() {
+            return Some(sdk);
+        }
+    }
+    MACOS_SDK_CACHE
+        .get_or_init(|| {
+            let out = Command::new("xcrun")
+                .arg("--show-sdk-path")
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if s.is_empty() { None } else { Some(s) }
+        })
+        .clone()
+}
+
 pub fn is_apple_clang(bin_path: &str) -> bool {
     let Ok(out) = Command::new(bin_path).arg("--version").output() else {
         return false;
@@ -54,7 +106,8 @@ pub fn is_apple_clang(bin_path: &str) -> bool {
         || lower.contains("clang version")
 }
 
-pub fn find_on_path(name: &str, env_path: &str) -> Option<String> {
+pub fn find_all_on_path(name: &str, env_path: &str) -> Vec<String> {
+    let mut results = Vec::new();
     for dir in env_path.split(':') {
         if dir.is_empty() {
             continue;
@@ -62,11 +115,18 @@ pub fn find_on_path(name: &str, env_path: &str) -> Option<String> {
         let full = Path::new(dir).join(name);
         if let Ok(meta) = fs::metadata(&full) {
             if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 {
-                return Some(full.to_string_lossy().into_owned());
+                let s = full.to_string_lossy().into_owned();
+                if !results.contains(&s) {
+                    results.push(s);
+                }
             }
         }
     }
-    None
+    results
+}
+
+pub fn find_on_path(name: &str, env_path: &str) -> Option<String> {
+    find_all_on_path(name, env_path).into_iter().next()
 }
 
 pub fn find_highest_versioned_with<F>(base: &str, env_path: &str, mut accept: F) -> Option<String>
@@ -114,7 +174,7 @@ fn find_candidate(candidates: &[&str], versioned_base: Option<&str>, env_path: &
 fn detect_gcc(env_path: &str, is_macos: bool) -> Option<String> {
     let accept = |full: &str| !is_macos || !is_apple_clang(full);
     for &c in &["gcc-12", "gcc"] {
-        if let Some(found) = find_on_path(c, env_path) {
+        for found in find_all_on_path(c, env_path) {
             if accept(&found) {
                 return Some(found);
             }
@@ -139,6 +199,7 @@ pub fn detect_tools_for_os(env_path: &str, is_macos: bool) -> Tools {
         scan_build: find_candidate(&["scan-build-12", "scan-build"], Some("scan-build"), env_path),
         gcc: detect_gcc(env_path, is_macos),
         valgrind: find_candidate(&["valgrind"], None, env_path),
+        leaks: find_candidate(&["leaks"], None, env_path),
         norminette: find_candidate(&["norminette"], None, env_path),
         make: find_candidate(&["make"], None, env_path),
         cbmc: find_candidate(&["cbmc"], None, env_path),
@@ -170,6 +231,7 @@ pub fn step_tool_name(id: StepId) -> Option<&'static str> {
         StepId::GccAnalyzer => Some("gcc"),
         StepId::AsanUbsan | StepId::Tsan | StepId::Msan => Some("cc"),
         StepId::Valgrind => Some("valgrind"),
+        StepId::Leaks => Some("leaks"),
         StepId::Cbmc => Some("cbmc"),
         StepId::FramaC => Some("framaC"),
     }
@@ -181,8 +243,9 @@ pub fn install_hint(tool_key: &str) -> &'static str {
         "tidy" => "clang-tidy (校舎: clang-tidy-12) が PATH にありません。Arch: `sudo pacman -S clang` / macOS: `brew install llvm`",
         "scanBuild" => "scan-build (校舎: scan-build-12) が PATH にありません。Arch: `sudo pacman -S clang-analyzer` / macOS: `brew install llvm`",
         "gcc" => "GNU gcc (校舎: gcc-12) が PATH にありません (macOS の /usr/bin/gcc は Apple clang のため非対応)。-fanalyzer は GCC 10 以降が必要です。macOS: `brew install gcc`",
-        "valgrind" => "valgrind が PATH にありません。Arch: `sudo pacman -S valgrind` (macOS 非対応環境ではチェックを外してください)",
-        "norminette" => "norminette が PATH にありません。校舎では標準で入っています。自分の機では `pipx install norminette` 等",
+        "valgrind" => "valgrind が PATH にありません。Arch: `sudo pacman -S valgrind` (macOS では valgrind 非対応の環境が多いため、代わりに「leaks (macOS)」を有効にし、valgrind のチェックを外してください)",
+        "leaks" => "leaks は macOS 標準のメモリリーク検査ツールです (`xcode-select --install` が必要)。Linux では valgrind を使用してください",
+        "norminette" => "norminette が PATH にありません。校舎では標準で入っています。自分の機 (Linux / macOS) では `pipx install norminette` (または `pip3 install --user norminette`) 等",
         "make" => "make が PATH にありません",
         "cbmc" => "cbmc が PATH にありません。ネイティブ版のみ対応です (校舎では Docker image を pull しない方針)",
         "framaC" => "frama-c が PATH にありません。ネイティブ版のみ対応です (校舎では Docker image を pull しない方針)",

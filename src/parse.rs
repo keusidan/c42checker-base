@@ -418,6 +418,137 @@ pub fn parse_valgrind(text: &str, root: &Path) -> ValgrindParse {
     }
 }
 
+pub struct LeaksParse {
+    pub diags: Vec<Diag>,
+    pub leak_count: usize,
+    pub leaked_bytes: usize,
+}
+
+fn parse_leaks_summary(line: &str) -> Option<(usize, usize)> {
+    let rest = line.trim().strip_prefix("Process ")?;
+    let colon = rest.find(':')?;
+    if !rest[..colon].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let after = rest[colon + 1..].trim_start();
+    let mut it = after.split_whitespace();
+    let count: usize = it.next()?.parse().ok()?;
+    let leak_kw = it.next()?;
+    if leak_kw != "leak" && leak_kw != "leaks" {
+        return None;
+    }
+    if it.next()? != "for" {
+        return None;
+    }
+    let bytes: usize = it.next()?.parse().ok()?;
+    let tail: Vec<&str> = it.take(3).collect();
+    if tail.len() >= 3 && tail[0] == "total" && tail[1] == "leaked" && tail[2].starts_with("bytes") {
+        Some((count, bytes))
+    } else {
+        None
+    }
+}
+
+fn extract_leaks_frame(line: &str, root: &Path) -> Option<(String, u32)> {
+    let mut hit: Option<(String, u32)> = None;
+    for tok in line.split(|c: char| c.is_whitespace() || c == '|' || c == '(' || c == ')') {
+        if tok.is_empty() {
+            continue;
+        }
+        let cleaned = tok.trim_end_matches([',', ';', '.']);
+        let Some(colon) = cleaned.rfind(':') else {
+            continue;
+        };
+        let file_part = &cleaned[..colon];
+        if !(file_part.ends_with(".c") || file_part.ends_with(".h")) {
+            continue;
+        }
+        let Ok(ln) = cleaned[colon + 1..].parse::<u32>() else {
+            continue;
+        };
+        if let Some(abs) = in_root_file(root, file_part) {
+            hit = Some((abs, ln));
+        }
+    }
+    hit
+}
+
+pub fn parse_leaks(text: &str, root: &Path) -> LeaksParse {
+    let clean = strip_ansi(text);
+    let lines: Vec<&str> = clean.lines().map(|l| l.trim_end_matches('\r')).collect();
+    let mut leak_count = 0usize;
+    let mut leaked_bytes = 0usize;
+    for line in &lines {
+        if let Some((c, b)) = parse_leaks_summary(line) {
+            leak_count = c;
+            leaked_bytes = b;
+        }
+    }
+    let mut diags = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("STACK OF ") {
+            if let (Some(q1), Some(q2)) = (rest.find('\''), rest.rfind('\'')) {
+                if q1 < q2 {
+                    let label = &rest[q1 + 1..q2];
+                    let msg = format!("leaks: {label}");
+                    let mut hit: Option<(String, u32)> = None;
+                    let end = (i + 1 + 40).min(lines.len());
+                    for fl in &lines[i + 1..end] {
+                        let ft = fl.trim();
+                        if ft.starts_with("====") || ft.starts_with("STACK OF ") {
+                            break;
+                        }
+                        if let Some(h) = extract_leaks_frame(fl, root) {
+                            hit = Some(h);
+                        }
+                    }
+                    if let Some((file, ln)) = hit {
+                        diags.push(Diag {
+                            file,
+                            line: ln,
+                            col: 1,
+                            severity: Severity::Error,
+                            message: msg,
+                            source: "leaks".to_string(),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Leak:") {
+            let mut toks = rest.split_whitespace();
+            let addr = toks.next().unwrap_or("0x0");
+            let size_tok = toks.next().unwrap_or("");
+            let bytes_str = size_tok.strip_prefix("size=").unwrap_or("0");
+            let msg = format!("leaks: {bytes_str} byte(s) leaked ({addr})");
+            let end = (i + 1 + 10).min(lines.len());
+            for fl in &lines[i + 1..end] {
+                if fl.trim().starts_with("Leak:") {
+                    break;
+                }
+                if let Some((file, ln)) = extract_leaks_frame(fl, root) {
+                    diags.push(Diag {
+                        file,
+                        line: ln,
+                        col: 1,
+                        severity: Severity::Error,
+                        message: msg,
+                        source: "leaks".to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    LeaksParse {
+        diags: dedupe(diags),
+        leak_count,
+        leaked_bytes,
+    }
+}
+
 pub fn parse_cbmc(text: &str, base_dir: &Path) -> Vec<Diag> {
     let mut diags = Vec::new();
     for raw in text.lines() {

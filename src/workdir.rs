@@ -51,6 +51,29 @@ pub fn dir_size(dir: &Path) -> u64 {
     total
 }
 
+pub fn parse_df_avail_mb(text: &str) -> Result<u64, String> {
+    let line = text
+        .lines()
+        .nth(1)
+        .ok_or_else(|| "df 出力を解析できません".to_string())?;
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    // macOS では Filesystem や Mounted on に空白が入ることがある (例: `map auto_home`、`/Volumes/Macintosh HD`)。
+    // Capacity% 列 (`NN%`) の直前が常に Available 列になるため、そちらを優先して読む。
+    if let Some(cap_idx) = cols.iter().position(|c| {
+        c.strip_suffix('%')
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|ch| ch.is_ascii_digit()))
+    }) {
+        if cap_idx >= 1 {
+            if let Ok(avail) = cols[cap_idx - 1].parse::<u64>() {
+                return Ok(avail);
+            }
+        }
+    }
+    cols.get(3)
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| "df 出力の空き容量を読み取れません".to_string())
+}
+
 pub fn free_space_mb(dir: &Path) -> Result<u64, String> {
     let out = Command::new("df")
         .arg("-Pm")
@@ -61,13 +84,7 @@ pub fn free_space_mb(dir: &Path) -> Result<u64, String> {
         return Err("df が失敗しました".to_string());
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().nth(1).ok_or_else(|| "df 出力を解析できません".to_string())?;
-    let cols: Vec<&str> = line.split_whitespace().collect();
-    let avail_mb = cols
-        .get(3)
-        .and_then(|s| s.parse::<u64>().ok())
-        .ok_or_else(|| "df 出力の空き容量を読み取れません".to_string())?;
-    Ok(avail_mb)
+    parse_df_avail_mb(&text)
 }
 
 pub fn is_on_rclone_mount(dir: &Path, mounts_text: Option<&str>) -> bool {
@@ -136,11 +153,13 @@ fn copy_walk(from: &Path, to: &Path, max_bytes: u64, copied: &mut u64) -> Result
         let name = entry.file_name().to_string_lossy().into_owned();
         if matches!(
             name.as_str(),
-            ".git" | WORK_DIR_NAME | "node_modules" | ".vscode"
+            ".git" | WORK_DIR_NAME | "node_modules" | ".vscode" | ".DS_Store"
         ) || name.ends_with(".o")
             || name.ends_with(".a")
             || name.ends_with(".so")
+            || name.ends_with(".dylib")
             || name.ends_with(".d")
+            || name.ends_with(".dSYM")
         {
             continue;
         }

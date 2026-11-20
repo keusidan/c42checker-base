@@ -42,6 +42,9 @@ pub fn exec_cmd_env(
         .stderr(Stdio::piped());
     if cfg!(target_os = "macos") {
         command.env("PATH", crate::tools::effective_env_path());
+        if let Some(sdk) = crate::tools::detect_macos_sdk_root() {
+            command.env("SDKROOT", sdk);
+        }
     }
     if opts.force_c_locale {
         command.env("LC_ALL", "C");

@@ -1,5 +1,5 @@
 use crate::exec::{exec_cmd, ExecOptions};
-use crate::tools::{find_on_path, install_hint};
+use crate::tools::{effective_env_path, find_all_on_path, install_hint};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -23,13 +23,19 @@ pub struct CtagsResolved {
 }
 
 pub fn resolve_ctags() -> CtagsResolved {
-    let env_path = env::var("PATH").unwrap_or_default();
+    resolve_ctags_in_path(&effective_env_path())
+}
+
+pub fn resolve_ctags_in_path(env_path: &str) -> CtagsResolved {
     let candidates = ["universal-ctags", "ctags-universal", "ctags"];
-    let present: Vec<&str> = candidates
-        .iter()
-        .copied()
-        .filter(|n| find_on_path(n, &env_path).is_some())
-        .collect();
+    let mut present: Vec<String> = Vec::new();
+    for name in candidates {
+        for full in find_all_on_path(name, env_path) {
+            if !present.contains(&full) {
+                present.push(full);
+            }
+        }
+    }
     if present.is_empty() {
         return CtagsResolved {
             bin: None,
@@ -38,9 +44,9 @@ pub fn resolve_ctags() -> CtagsResolved {
         };
     }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for name in &present {
+    for full in &present {
         let res = exec_cmd(
-            name,
+            full,
             &["--version".to_string()],
             &ExecOptions {
                 cwd: &cwd,
@@ -51,7 +57,7 @@ pub fn resolve_ctags() -> CtagsResolved {
         );
         if res.output.to_ascii_lowercase().contains("universal ctags") {
             return CtagsResolved {
-                bin: Some((*name).to_string()),
+                bin: Some(full.clone()),
                 reason: None,
                 hint: None,
             };
