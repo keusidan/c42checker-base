@@ -319,7 +319,7 @@ fn test_real_macos_tools_and_leaks_step() {
     fs::create_dir_all(&proj).unwrap();
     fs::write(
         proj.join("main.c"),
-        "#include <stdlib.h>\nstatic void leak_mem(void) { char *p = malloc(32); if (p) p[0] = 1; }\nint main(void) { leak_mem(); return 0; }\n",
+        "#include <stdio.h>\n#include <stdlib.h>\nstatic void leak_mem(void) { char *p = malloc(64); if (p) p[0] = 1; p = NULL; (void)p; }\nint main(void) { leak_mem(); printf(\"leaked\\n\"); return 0; }\n",
     )
     .unwrap();
     let ctx = build_context(proj.clone(), Settings::default(), Arc::new(AtomicBool::new(false)), Vec::new());
